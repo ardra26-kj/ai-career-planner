@@ -121,12 +121,78 @@ def plan_schema():
     )
 
 
+def quiz_schema():
+    return types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "skills": types.Schema(
+                type=types.Type.ARRAY,
+                min_items=1,
+                max_items=5,
+                items=types.Schema(type=types.Type.STRING),
+            ),
+            "questions": types.Schema(
+                type=types.Type.ARRAY,
+                min_items=3,
+                max_items=15,
+                items=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "skill": types.Schema(type=types.Type.STRING),
+                        "difficulty": types.Schema(type=types.Type.STRING),
+                        "question": types.Schema(type=types.Type.STRING),
+                        "options": types.Schema(
+                            type=types.Type.ARRAY,
+                            min_items=4,
+                            max_items=4,
+                            items=types.Schema(type=types.Type.STRING),
+                        ),
+                        "correct_answer_index": types.Schema(
+                            type=types.Type.INTEGER,
+                            minimum=0,
+                            maximum=3,
+                        ),
+                        "explanation": types.Schema(type=types.Type.STRING),
+                    },
+                    required=[
+                        "skill",
+                        "difficulty",
+                        "question",
+                        "options",
+                        "correct_answer_index",
+                        "explanation",
+                    ],
+                ),
+            )
+        },
+        required=["skills", "questions"],
+    )
+
+
 def generate_with_retry(client, contents, config):
     models = ("gemini-3.5-flash-lite",)
     last_error = None
     for model_index, model in enumerate(models):
         attempts = 2 if model_index == 0 else 1
         for attempt in range(attempts):
+            try:
+                return client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
+            except errors.APIError as error:
+                if error.code not in (429, 500, 503, 504):
+                    raise
+                last_error = error
+    raise last_error
+
+
+def generate_quiz_with_retry(client, contents, config):
+    models = ("gemini-3.5-flash", "gemini-3.5-flash-lite")
+    last_error = None
+    for model in models:
+        for _ in range(2):
             try:
                 return client.models.generate_content(
                     model=model,
@@ -421,6 +487,211 @@ if plan:
             {"role": "assistant", "content": answer}
         )
         st.rerun()
+
+# Skill assessment lives in its own tab.
+quiz_tab = st.tabs(["Skill Assessment Quiz"])[0]
+with quiz_tab:
+    st.subheader("Skill Assessment Quiz")
+    profile_skills = [
+        item.strip()
+        for item in skills.replace("\n", ",").split(",")
+        if item.strip()
+    ]
+    plan_skills = [
+        item["skill"]
+        for item in (plan or {}).get("skill_gaps", [])
+        if item.get("skill")
+    ]
+    fallback_skills = list(dict.fromkeys(profile_skills + plan_skills))
+    if resume is not None:
+        st.caption(
+            "The quiz will extract technical skills from your uploaded resume. "
+            "The PDF is sent to Gemini for this request and is not saved by the app."
+        )
+    elif fallback_skills:
+        st.caption(
+            "No resume is uploaded. The quiz will use your skills from the career "
+            "profile instead."
+        )
+    else:
+        st.info("Upload a resume above, or enter skills in your career profile, to begin.")
+
+    # Extract skills and create questions at all three difficulty levels.
+    with st.form("skill_quiz_form"):
+        generate_quiz = st.form_submit_button(
+            "Extract skills and generate quiz",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if generate_quiz:
+        if resume is None and not fallback_skills:
+            st.warning(
+                "Upload a resume or add skills to your career profile before "
+                "generating a quiz."
+            )
+        else:
+            st.session_state["skill_quiz"] = None
+            st.session_state["skill_quiz_result"] = None
+            for index in range(15):
+                st.session_state.pop(f"skill_quiz_answer_{index}", None)
+            try:
+                client = genai.Client(
+                    api_key=st.secrets["GEMINI_API_KEY"],
+                    http_options=types.HttpOptions(api_version="v1beta"),
+                )
+                quiz_config = types.GenerateContentConfig(
+                    system_instruction=(
+                        "Identify up to five technical skills supported by the "
+                        "provided resume, or use the provided skill list when "
+                        "there is no resume. Create exactly one original "
+                        "multiple-choice question for each skill at each of "
+                        "these levels: Easy, Medium, and Hard. Use only those "
+                        "skills. Give each question four distinct options, one "
+                        "correct answer, and a short explanation. The "
+                        "correct_answer_index is zero-based."
+                    ),
+                    temperature=0.7,
+                    response_mime_type="application/json",
+                    response_schema=quiz_schema(),
+                )
+                quiz_prompt = json.dumps(
+                    {
+                        "fallback_skills": fallback_skills,
+                        "difficulty_levels": ["Easy", "Medium", "Hard"],
+                        "maximum_skills": 5,
+                    },
+                    ensure_ascii=False,
+                )
+                quiz_contents = [quiz_prompt]
+                if resume is not None:
+                    quiz_contents.append(
+                        types.Part.from_bytes(
+                            data=resume.getvalue(),
+                            mime_type="application/pdf",
+                        )
+                    )
+                with st.spinner("Making your quiz..."):
+                    response = generate_quiz_with_retry(
+                        client, quiz_contents, quiz_config
+                    )
+
+                if not getattr(response, "text", None):
+                    raise ValueError("Gemini returned an empty quiz.")
+                quiz = json.loads(response.text)
+                extracted_skills = quiz.get("skills")
+                questions = quiz.get("questions")
+                if (
+                    not isinstance(extracted_skills, list)
+                    or not 1 <= len(extracted_skills) <= 5
+                    or not isinstance(questions, list)
+                ):
+                    raise ValueError("Gemini returned an incomplete quiz.")
+                expected_questions = {
+                    (skill, level)
+                    for skill in extracted_skills
+                    for level in ("Easy", "Medium", "Hard")
+                }
+                actual_questions = set()
+                for question in questions:
+                    if (
+                        not isinstance(question, dict)
+                        or question.get("skill") not in extracted_skills
+                        or question.get("difficulty")
+                        not in ("Easy", "Medium", "Hard")
+                        or not isinstance(question.get("options"), list)
+                        or len(question["options"]) != 4
+                        or type(question.get("correct_answer_index")) is not int
+                        or question["correct_answer_index"] not in range(4)
+                    ):
+                        raise ValueError("Gemini returned an invalid question.")
+                    actual_questions.add(
+                        (question["skill"], question["difficulty"])
+                    )
+                if (
+                    len(questions) != len(expected_questions)
+                    or actual_questions != expected_questions
+                ):
+                    raise ValueError("Gemini returned an incomplete quiz.")
+                st.session_state["skill_quiz"] = {
+                    "questions": questions,
+                    "skills": extracted_skills,
+                }
+            except Exception as error:
+                st.error(friendly_error(error))
+
+    # Show questions and score answers while keeping quiz data across reruns.
+    quiz = st.session_state.get("skill_quiz")
+    if quiz:
+        quiz_questions = quiz["questions"]
+        st.write("Skills identified: " + ", ".join(quiz["skills"]))
+        if st.session_state.get("skill_quiz_result") is None:
+            with st.form("skill_quiz_answers_form"):
+                answers = []
+                for index, question in enumerate(quiz_questions):
+                    st.markdown(
+                        f"**{index + 1}. [{question['difficulty']}] "
+                        f"{question['question']}**"
+                    )
+                    answers.append(
+                        st.radio(
+                            f"Question {index + 1}",
+                            options=range(4),
+                            format_func=lambda option, choices=question["options"]: (
+                                choices[option]
+                            ),
+                            index=None,
+                            key=f"skill_quiz_answer_{index}",
+                            label_visibility="collapsed",
+                        )
+                    )
+                submit_answers = st.form_submit_button(
+                    "Check my answers", type="primary", use_container_width=True
+                )
+
+            if submit_answers:
+                if any(answer is None for answer in answers):
+                    st.warning("Please answer every question before checking.")
+                else:
+                    st.session_state["skill_quiz_result"] = answers
+                    st.rerun()
+
+        quiz_result = st.session_state.get("skill_quiz_result")
+        if quiz_result is not None:
+            score = sum(
+                answer == question["correct_answer_index"]
+                for answer, question in zip(quiz_result, quiz_questions)
+            )
+            st.markdown("### Your score")
+            st.markdown(
+                f'<div class="score">{score}<span> / {len(quiz_questions)}</span></div>',
+                unsafe_allow_html=True,
+            )
+
+            skill_scores = {}
+            for answer, question in zip(quiz_result, quiz_questions):
+                skill = question["skill"]
+                if skill not in skill_scores:
+                    skill_scores[skill] = [0, 0]
+                skill_scores[skill][1] += 1
+                if answer == question["correct_answer_index"]:
+                    skill_scores[skill][0] += 1
+
+            st.markdown("### Score by skill")
+            for skill, (correct, total) in skill_scores.items():
+                st.write(f"**{skill}:** {correct} / {total}")
+
+            st.markdown("### Correct answers")
+            for index, question in enumerate(quiz_questions):
+                correct_option = question["options"][
+                    question["correct_answer_index"]
+                ]
+                st.markdown(
+                    f"**{index + 1}. [{question['difficulty']}] "
+                    f"{question['question']}**  \n"
+                    f"Correct answer: **{correct_option}**  \n"
+                    f"{question['explanation']}"
+                )
 
 # Footer
 st.divider()
