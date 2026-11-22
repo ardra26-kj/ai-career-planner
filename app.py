@@ -122,7 +122,7 @@ def plan_schema():
 
 
 def generate_with_retry(client, contents, config):
-    models = ("gemini-3.8-flash", "gemini-3.8-flash-lite")
+    models = ("gemini-3.5-flash-lite",)
     last_error = None
     for model_index, model in enumerate(models):
         attempts = 2 if model_index == 0 else 1
