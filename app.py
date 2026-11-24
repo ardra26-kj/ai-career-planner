@@ -832,6 +832,6 @@ with quiz_tab:
 # Footer
 st.divider()
 st.markdown(
-    '<div class="footer">Built at the Techolas AI Wing weekend · AI suggestions, not guarantees.</div>',
+    '<div class="Built by Ardra"</div>',
     unsafe_allow_html=True,
 )
